@@ -1,83 +1,56 @@
 """
-session_store.py — SQLite-backed persistent logging layer
-==========================================================
-Enables stop-and-resume semantics: evaluation jobs can be interrupted at
-any point and continued exactly where they left off.
+session_store.py — MongoDB Persistent Logging Layer
+=====================================================
+Replaces the original SQLite backend with a remote MongoDB server.
 
-Schema overview
+Collections
+-----------
+  sessions    — one document per red-teaming session
+  turns       — one document per evaluated (prompt, response) pair
+  behaviors   — optional catalog of HarmBench behavior definitions
+
+Connection
+----------
+Configure via environment variable or constructor argument:
+
+    export HARMBENCH_MONGO_URI="mongodb://user:pass@host:27017/harmbench?authSource=admin"
+
+Or pass ``mongo_uri`` directly to ``SessionStore()``.
+Falls back to ``mongodb://localhost:27017`` for local development.
+
+Indexes
+-------
+  sessions : session_id (unique)
+  turns    : (session_id, turn_index) (unique), verdict
+  behaviors: behavior_id (unique)
+
+Stop-and-Resume
 ---------------
-  sessions    – one row per red-teaming session (may span many turns)
-  turns       – one row per evaluated (prompt, response) pair
-  behaviors   – optional catalog of HarmBench behavior definitions
-
-All writes use WAL mode for crash safety on the T4 host.
+``already_evaluated(session_id, turn_index)`` queries the unique compound
+index so interrupted runs skip already-logged turns.
 """
 
 from __future__ import annotations
 
-import json
-import sqlite3
+import logging
+import os
 import time
-from contextlib import contextmanager
-from dataclasses import asdict
-from pathlib import Path
-from typing import Any, Generator, Optional
+from typing import Any, Optional
+
+from pymongo import MongoClient, ASCENDING, DESCENDING
+from pymongo.collection import Collection
+from pymongo.errors import DuplicateKeyError
 
 from judge_ensemble import EnsembleResult, JudgeVerdict
 
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
-# Schema DDL
+# Default connection parameters
 # ---------------------------------------------------------------------------
 
-_DDL = """
-PRAGMA journal_mode = WAL;
-PRAGMA synchronous  = NORMAL;
-PRAGMA foreign_keys = ON;
-
-CREATE TABLE IF NOT EXISTS sessions (
-    session_id      TEXT PRIMARY KEY,
-    attack_method   TEXT,
-    target_model    TEXT,
-    behavior_id     TEXT,
-    created_at      REAL NOT NULL DEFAULT (unixepoch('now', 'subsec')),
-    updated_at      REAL NOT NULL DEFAULT (unixepoch('now', 'subsec')),
-    status          TEXT NOT NULL DEFAULT 'IN_PROGRESS',  -- IN_PROGRESS | BREACHED | EXHAUSTED
-    total_turns     INTEGER NOT NULL DEFAULT 0,
-    breach_turn     INTEGER,          -- TTB: first turn index at which SUCCESS was returned
-    notes           TEXT
-);
-
-CREATE TABLE IF NOT EXISTS turns (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    session_id      TEXT NOT NULL REFERENCES sessions(session_id),
-    turn_index      INTEGER NOT NULL,
-    malicious_prompt TEXT NOT NULL,
-    model_response  TEXT NOT NULL,
-    verdict         TEXT NOT NULL,
-    stage_reached   INTEGER NOT NULL,
-    refusal_detected INTEGER NOT NULL DEFAULT 0,
-    llama_guard_label TEXT,
-    harm_category   TEXT,
-    harmbench_answer TEXT,
-    latency_ms      REAL,
-    recorded_at     REAL NOT NULL DEFAULT (unixepoch('now', 'subsec')),
-    UNIQUE (session_id, turn_index)
-);
-
-CREATE TABLE IF NOT EXISTS behaviors (
-    behavior_id     TEXT PRIMARY KEY,
-    category        TEXT,
-    subcategory     TEXT,
-    behavior_text   TEXT NOT NULL,
-    attack_method   TEXT,
-    source          TEXT   -- e.g. "HarmBench-standard", "AdvBench"
-);
-
-CREATE INDEX IF NOT EXISTS idx_turns_session  ON turns (session_id);
-CREATE INDEX IF NOT EXISTS idx_turns_verdict  ON turns (verdict);
-CREATE INDEX IF NOT EXISTS idx_sessions_model ON sessions (target_model);
-"""
+_DEFAULT_URI = "mongodb://localhost:27017"
+_DEFAULT_DB  = "harmbench"
 
 
 # ---------------------------------------------------------------------------
@@ -86,40 +59,59 @@ CREATE INDEX IF NOT EXISTS idx_sessions_model ON sessions (target_model);
 
 class SessionStore:
     """
-    Thread-safe SQLite wrapper.  One instance per evaluation process.
+    MongoDB-backed persistent store for HarmBench evaluation sessions.
 
-    Usage
-    -----
-        store = SessionStore("results/eval_run.db")
-        store.upsert_session(session_id="s1", attack_method="GCG", ...)
-        store.record_turn(result, malicious_prompt, model_response)
-        store.mark_breached("s1", breach_turn=3)
+    Parameters
+    ----------
+    mongo_uri : Full MongoDB connection URI.  If omitted, reads
+                ``HARMBENCH_MONGO_URI`` env var, then falls back to
+                ``mongodb://localhost:27017``.
+    db_name   : Database name (default: ``"harmbench"``).
     """
 
-    def __init__(self, db_path: str | Path = "harmbench_results.db"):
-        self._db_path = Path(db_path)
-        self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(str(self._db_path), check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._bootstrap()
+    def __init__(
+        self,
+        mongo_uri: Optional[str] = None,
+        db_name:   str           = _DEFAULT_DB,
+    ):
+        uri = mongo_uri or os.getenv("HARMBENCH_MONGO_URI", _DEFAULT_URI)
+        logger.info("[MongoDB] Connecting to %s / %s …", uri.split("@")[-1], db_name)
+
+        self._client: MongoClient = MongoClient(uri, serverSelectionTimeoutMS=10_000)
+        # Trigger connection check immediately so misconfigured URIs surface early
+        self._client.admin.command("ping")
+        logger.info("[MongoDB] Connected.")
+
+        db = self._client[db_name]
+        self._sessions:  Collection = db["sessions"]
+        self._turns:     Collection = db["turns"]
+        self._behaviors: Collection = db["behaviors"]
+
+        self._ensure_indexes()
 
     # ------------------------------------------------------------------
-    # Internal
+    # Index creation (idempotent)
     # ------------------------------------------------------------------
 
-    def _bootstrap(self) -> None:
-        with self._conn:
-            self._conn.executescript(_DDL)
-
-    @contextmanager
-    def _tx(self) -> Generator[sqlite3.Connection, None, None]:
-        """Yield a connection; commit on success, rollback on error."""
-        try:
-            yield self._conn
-            self._conn.commit()
-        except Exception:
-            self._conn.rollback()
-            raise
+    def _ensure_indexes(self) -> None:
+        # sessions
+        self._sessions.create_index(
+            [("session_id", ASCENDING)], unique=True, background=True
+        )
+        self._sessions.create_index(
+            [("target_model", ASCENDING)], background=True
+        )
+        # turns
+        self._turns.create_index(
+            [("session_id", ASCENDING), ("turn_index", ASCENDING)],
+            unique=True, background=True,
+        )
+        self._turns.create_index([("verdict", ASCENDING)], background=True)
+        # behaviors
+        self._behaviors.create_index(
+            [("behavior_id", ASCENDING)], unique=True, background=True
+        )
+        logger.debug("[MongoDB] Indexes ensured.")
 
     # ------------------------------------------------------------------
     # Session helpers
@@ -133,54 +125,57 @@ class SessionStore:
         behavior_id:   str = "",
         notes:         str = "",
     ) -> None:
-        sql = """
-        INSERT INTO sessions (session_id, attack_method, target_model, behavior_id, notes)
-        VALUES (:session_id, :attack_method, :target_model, :behavior_id, :notes)
-        ON CONFLICT(session_id) DO UPDATE SET
-            updated_at = unixepoch('now', 'subsec')
-        """
-        with self._tx() as con:
-            con.execute(sql, {
-                "session_id":    session_id,
-                "attack_method": attack_method,
-                "target_model":  target_model,
-                "behavior_id":   behavior_id,
-                "notes":         notes,
-            })
+        """Insert a new session document or touch ``updated_at`` if it exists."""
+        now = time.time()
+        self._sessions.update_one(
+            {"session_id": session_id},
+            {
+                "$setOnInsert": {
+                    "session_id":    session_id,
+                    "attack_method": attack_method,
+                    "target_model":  target_model,
+                    "behavior_id":   behavior_id,
+                    "notes":         notes,
+                    "status":        "IN_PROGRESS",
+                    "total_turns":   0,
+                    "breach_turn":   None,
+                    "created_at":    now,
+                },
+                "$set": {"updated_at": now},
+            },
+            upsert=True,
+        )
 
     def mark_breached(self, session_id: str, breach_turn: int) -> None:
-        sql = """
-        UPDATE sessions
-        SET status = 'BREACHED', breach_turn = :bt,
-            updated_at = unixepoch('now', 'subsec')
-        WHERE session_id = :sid
-        """
-        with self._tx() as con:
-            con.execute(sql, {"bt": breach_turn, "sid": session_id})
+        self._sessions.update_one(
+            {"session_id": session_id},
+            {"$set": {
+                "status":       "BREACHED",
+                "breach_turn":  breach_turn,
+                "updated_at":   time.time(),
+            }},
+        )
 
     def mark_exhausted(self, session_id: str, total_turns: int) -> None:
-        sql = """
-        UPDATE sessions
-        SET status = 'EXHAUSTED', total_turns = :tt,
-            updated_at = unixepoch('now', 'subsec')
-        WHERE session_id = :sid
-        """
-        with self._tx() as con:
-            con.execute(sql, {"tt": total_turns, "sid": session_id})
+        self._sessions.update_one(
+            {"session_id": session_id},
+            {"$set": {
+                "status":      "EXHAUSTED",
+                "total_turns": total_turns,
+                "updated_at":  time.time(),
+            }},
+        )
 
     def get_session(self, session_id: str) -> Optional[dict[str, Any]]:
-        row = self._conn.execute(
-            "SELECT * FROM sessions WHERE session_id = ?", (session_id,)
-        ).fetchone()
-        return dict(row) if row else None
+        doc = self._sessions.find_one({"session_id": session_id}, {"_id": 0})
+        return doc  # type: ignore[return-value]
 
     def already_evaluated(self, session_id: str, turn_index: int) -> bool:
-        """Check whether a (session, turn) pair already has a result (resume guard)."""
-        row = self._conn.execute(
-            "SELECT 1 FROM turns WHERE session_id = ? AND turn_index = ?",
-            (session_id, turn_index),
-        ).fetchone()
-        return row is not None
+        """True if (session_id, turn_index) already has a turn document."""
+        return self._turns.count_documents(
+            {"session_id": session_id, "turn_index": turn_index},
+            limit=1,
+        ) > 0
 
     # ------------------------------------------------------------------
     # Turn recording
@@ -192,38 +187,41 @@ class SessionStore:
         malicious_prompt: str,
         model_response:   str,
     ) -> None:
-        sql = """
-        INSERT OR REPLACE INTO turns
-            (session_id, turn_index, malicious_prompt, model_response,
-             verdict, stage_reached, refusal_detected, llama_guard_label,
-             harm_category, harmbench_answer, latency_ms)
-        VALUES
-            (:session_id, :turn_index, :malicious_prompt, :model_response,
-             :verdict, :stage_reached, :refusal_detected, :llama_guard_label,
-             :harm_category, :harmbench_answer, :latency_ms)
-        """
-        with self._tx() as con:
-            con.execute(sql, {
-                "session_id":        result.session_id or "",
-                "turn_index":        result.turn_index,
-                "malicious_prompt":  malicious_prompt,
-                "model_response":    model_response,
-                "verdict":           result.verdict.value,
-                "stage_reached":     result.stage_reached,
-                "refusal_detected":  int(result.refusal_detected),
-                "llama_guard_label": result.llama_guard_label,
-                "harm_category":     result.harm_category,
-                "harmbench_answer":  result.harmbench_answer,
-                "latency_ms":        result.latency_ms,
-            })
-            # Keep sessions.total_turns in sync
-            if result.session_id:
-                con.execute(
-                    "UPDATE sessions SET total_turns = total_turns + 1, "
-                    "updated_at = unixepoch('now', 'subsec') "
-                    "WHERE session_id = ?",
-                    (result.session_id,),
-                )
+        """Insert a turn document.  Uses upsert to be idempotent on retries."""
+        now = time.time()
+        doc: dict[str, Any] = {
+            "session_id":         result.session_id or "",
+            "turn_index":         result.turn_index,
+            "malicious_prompt":   malicious_prompt,
+            "model_response":     model_response,
+            "verdict":            result.verdict.value,
+            "stage_reached":      result.stage_reached,
+            "refusal_detected":   result.refusal_detected,
+            "tool_calls_found":   result.tool_calls_found,
+            "raw_judge_output":   result.raw_judge_output,
+            "latency_ms":         result.latency_ms,
+            "recorded_at":        now,
+            # Flattened TriLabels (None-safe)
+            "intent_harm":        result.labels.intent_harm    if result.labels else None,
+            "response_harm":      result.labels.response_harm  if result.labels else None,
+            "refusal_signal":     result.labels.refusal_signal if result.labels else None,
+            "label_parse_error":  result.labels.parse_error    if result.labels else None,
+        }
+        try:
+            self._turns.update_one(
+                {"session_id": doc["session_id"], "turn_index": doc["turn_index"]},
+                {"$setOnInsert": doc},
+                upsert=True,
+            )
+        except DuplicateKeyError:
+            pass  # Already present — resume guard is working correctly
+
+        # Increment session turn counter
+        if result.session_id:
+            self._sessions.update_one(
+                {"session_id": result.session_id},
+                {"$inc": {"total_turns": 1}, "$set": {"updated_at": now}},
+            )
 
     # ------------------------------------------------------------------
     # Behavior catalog
@@ -238,58 +236,94 @@ class SessionStore:
         attack_method: str = "",
         source:        str = "HarmBench-standard",
     ) -> None:
-        sql = """
-        INSERT OR IGNORE INTO behaviors
-            (behavior_id, category, subcategory, behavior_text, attack_method, source)
-        VALUES (:behavior_id, :category, :subcategory, :behavior_text, :attack_method, :source)
-        """
-        with self._tx() as con:
-            con.execute(sql, {
+        self._behaviors.update_one(
+            {"behavior_id": behavior_id},
+            {"$setOnInsert": {
                 "behavior_id":   behavior_id,
+                "behavior_text": behavior_text,
                 "category":      category,
                 "subcategory":   subcategory,
-                "behavior_text": behavior_text,
                 "attack_method": attack_method,
                 "source":        source,
-            })
+            }},
+            upsert=True,
+        )
 
     # ------------------------------------------------------------------
     # Analytics queries (used by MetricsEngine)
     # ------------------------------------------------------------------
 
-    def all_turns(self, filters: Optional[dict[str, Any]] = None) -> list[dict[str, Any]]:
+    def all_turns(
+        self,
+        filters: Optional[dict[str, Any]] = None,
+    ) -> list[dict[str, Any]]:
         """
-        Return all turn rows, optionally filtered by:
-          target_model, attack_method, behavior_id, verdict.
-        """
-        base = """
-        SELECT t.*, s.attack_method, s.target_model, s.behavior_id,
-               b.category, b.subcategory
-        FROM turns t
-        JOIN sessions s ON t.session_id = s.session_id
-        LEFT JOIN behaviors b ON s.behavior_id = b.behavior_id
-        """
-        clauses: list[str] = []
-        params:  list[Any] = []
+        Return enriched turn documents joined with session and behavior data.
 
+        Supported filter keys: target_model, attack_method, behavior_id, verdict.
+        """
+        # Aggregate pipeline: turns → join sessions → join behaviors
+        pipeline: list[dict] = [
+            {
+                "$lookup": {
+                    "from":         "sessions",
+                    "localField":   "session_id",
+                    "foreignField": "session_id",
+                    "as":           "_session",
+                }
+            },
+            {"$unwind": {"path": "$_session", "preserveNullAndEmptyArrays": True}},
+            {
+                "$lookup": {
+                    "from":         "behaviors",
+                    "localField":   "_session.behavior_id",
+                    "foreignField": "behavior_id",
+                    "as":           "_behavior",
+                }
+            },
+            {"$unwind": {"path": "$_behavior", "preserveNullAndEmptyArrays": True}},
+            {
+                "$addFields": {
+                    "attack_method": "$_session.attack_method",
+                    "target_model":  "$_session.target_model",
+                    "behavior_id":   "$_session.behavior_id",
+                    "category":      "$_behavior.category",
+                    "subcategory":   "$_behavior.subcategory",
+                }
+            },
+            {"$project": {"_id": 0, "_session": 0, "_behavior": 0}},
+        ]
+
+        # Apply filters as a $match stage at the start
         if filters:
-            for col in ("target_model", "attack_method", "behavior_id", "verdict"):
-                if col in filters:
-                    clauses.append(f"s.{col} = ?" if col != "verdict" else f"t.{col} = ?")
-                    params.append(filters[col])
+            match: dict[str, Any] = {}
+            if "verdict" in filters:
+                match["verdict"] = filters["verdict"]
+            pipeline.insert(0, {"$match": match})
 
-        if clauses:
-            base += " WHERE " + " AND ".join(clauses)
+            # Session-level filters applied after lookup
+            session_match: dict[str, Any] = {}
+            for key in ("target_model", "attack_method", "behavior_id"):
+                if key in filters:
+                    session_match[f"_session.{key}"] = filters[key]
+            if session_match:
+                pipeline.insert(
+                    next(i for i, s in enumerate(pipeline) if "$unwind" in s) + 1,
+                    {"$match": session_match},
+                )
 
-        rows = self._conn.execute(base, params).fetchall()
-        return [dict(r) for r in rows]
+        return list(self._turns.aggregate(pipeline))
 
     def breach_turns(self) -> list[dict[str, Any]]:
-        """Return all sessions that were breached, with TTB."""
-        rows = self._conn.execute(
-            "SELECT * FROM sessions WHERE status = 'BREACHED'"
-        ).fetchall()
-        return [dict(r) for r in rows]
+        """Return all session documents with status BREACHED."""
+        return list(
+            self._sessions.find({"status": "BREACHED"}, {"_id": 0})
+        )
+
+    # ------------------------------------------------------------------
+    # Housekeeping
+    # ------------------------------------------------------------------
 
     def close(self) -> None:
-        self._conn.close()
+        self._client.close()
+        logger.info("[MongoDB] Connection closed.")
