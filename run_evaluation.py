@@ -338,7 +338,7 @@ def _demo() -> None:
         return [s for s in _mem["sessions"].values() if s.get("status") == "BREACHED"]
     def _close(self): pass
 
-    _SS.__init__    = lambda self, **kw: None
+    _SS.__init__ = lambda self, *args, **kw: None
     _SS.upsert_session = _upsert_session
     _SS.mark_breached  = _mark_breached
     _SS.mark_exhausted = _mark_exhausted
