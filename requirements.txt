@@ -1,4 +1,4 @@
-# HarmBench WildGuard Jailbreak Oracle — requirements.txt
+# FortiPrompt RedTeam Evaluator — requirements.txt
 # Tested on Ubuntu 22.04 + CUDA 12.1 + Tesla T4 (16 GB VRAM)
 
 # ── Core ML stack ────────────────────────────────────────────────────────────
@@ -7,8 +7,14 @@ transformers>=4.40.0
 accelerate>=0.27.0
 bitsandbytes>=0.43.0          # 4-bit NF4 quantisation for WildGuard
 
+# ── API server ───────────────────────────────────────────────────────────────
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0     # includes uvloop + httptools for max throughput
+websockets>=12.0
+pydantic>=2.7.0
+
 # ── MongoDB client ───────────────────────────────────────────────────────────
-pymongo>=4.6.0                # Remote MongoDB driver
+pymongo>=4.6.0
 
 # ── Analytics & visualisation ────────────────────────────────────────────────
 matplotlib>=3.8.0
@@ -18,3 +24,4 @@ pandas>=2.1.0
 # ── Utilities ────────────────────────────────────────────────────────────────
 tqdm
 numpy
+python-dotenv                 # optional: load .env for MONGO_URI / JUDGE_* vars
