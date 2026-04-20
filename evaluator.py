@@ -3,41 +3,44 @@ evaluator.py — Multi-Turn Session Evaluator
 ============================================
 Orchestrates the full pipeline:
 
-  Step 0  OpenAI log normalisation  (openai_schema.py)
   Step 1  Fast-Refusal Filter       (judge_ensemble.py)
   Step 2  WildGuard Unified Inference
   Step 3  Boolean Classification → Breach detection
 
-Persistent storage in MongoDB via SessionStore with stop-and-resume support.
+Input contract
+--------------
+All public methods accept **plain string lists**:
 
-Multi-turn logic
-----------------
-  Turn 0  : Benign seed — expected SAFE, tagged is_benign=True in DB.
-  Turn N  : Payload — full 3-step pipeline.
-  Breach  : SUCCESS verdict → session flagged BREACHED, TTB logged.
-  Resume  : already_evaluated() guard skips turns already in the DB.
+    prompts   : list[str]   — ordered attacker / user turns
+    responses : list[str]   — ordered target model responses (same length)
 
-Integration with FortiPrompt
------------------------------
-Two high-level entry points:
+These two lists are zipped into (prompt, response) pairs internally.
+The OpenAI ChatCompletion layer has been removed entirely.
 
-  run_session(turns, ...)          — list of (prompt, response) string pairs
-  run_session_openai(payloads, …)  — list of raw OpenAI ChatCompletion dicts
+Persistent storage
+------------------
+MongoDB writes happen in a background asyncio task so they never block
+the streaming WebSocket response.  Pass ``persist=False`` to disable.
 
-Both return a SessionSummary with per-turn EnsembleResult objects.
-For single-shot evaluation without a session use judge_ensemble.evaluate_response().
+Throughput optimisations
+------------------------
+  • Entire session batched into one EnsembleJudge.evaluate_batch() call
+    which packs non-regex turns into a single padded GPU forward pass.
+  • DB writes are fire-and-forget (asyncio.ensure_future).
+  • run_batch_async() evaluates multiple sessions concurrently using
+    asyncio.gather, limited by a semaphore so the GPU isn't over-subscribed.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from judge_ensemble import EnsembleJudge, EnsembleResult, JudgeVerdict
-from openai_schema import OpenAIContextExtractor
 from session_store import SessionStore
 from metrics_engine import MetricsEngine, print_full_report
 
@@ -45,20 +48,55 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Public data class
+# Public data classes
 # ---------------------------------------------------------------------------
 
 @dataclass
+class TurnResult:
+    """Result for a single evaluated turn, ready to stream to the UI."""
+    turn_index:       int
+    prompt:           str
+    response:         str
+    verdict:          str            # JudgeVerdict.value
+    is_breach:        bool
+    is_benign:        bool
+    latency_ms:       float
+    stage_reached:    int
+    refusal_detected: bool
+    intent_harm:      Optional[bool]
+    response_harm:    Optional[bool]
+    refusal_signal:   Optional[bool]
+    raw_judge_output: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "turn_index":       self.turn_index,
+            "verdict":          self.verdict,
+            "is_breach":        self.is_breach,
+            "is_benign":        self.is_benign,
+            "latency_ms":       round(self.latency_ms, 2),
+            "stage_reached":    self.stage_reached,
+            "refusal_detected": self.refusal_detected,
+            "labels": {
+                "intent_harm":    self.intent_harm,
+                "response_harm":  self.response_harm,
+                "refusal_signal": self.refusal_signal,
+            },
+            "raw_judge_output": self.raw_judge_output,
+        }
+
+
+@dataclass
 class SessionSummary:
-    """Returned by every run_session* call."""
+    """Returned by every run_session* call. Also sent as the final WS message."""
     session_id:    str
     attack_method: str
     target_model:  str
     behavior_id:   str
-    status:        str             # IN_PROGRESS | BREACHED | EXHAUSTED
+    status:        str              # IN_PROGRESS | BREACHED | EXHAUSTED
     total_turns:   int
     breach_turn:   Optional[int]
-    turn_results:  list[EnsembleResult] = field(default_factory=list)
+    turn_results:  list[TurnResult] = field(default_factory=list)
 
     @property
     def ttb(self) -> Optional[int]:
@@ -85,7 +123,7 @@ class SessionSummary:
 
 
 # ---------------------------------------------------------------------------
-# Multi-Turn Evaluator
+# Core Evaluator
 # ---------------------------------------------------------------------------
 
 class MultiTurnEvaluator:
@@ -94,9 +132,11 @@ class MultiTurnEvaluator:
 
     Parameters
     ----------
-    mongo_uri  : MongoDB connection URI.  Reads HARMBENCH_MONGO_URI env if None.
-    judge      : Pre-constructed EnsembleJudge.  Created with defaults if None.
+    mongo_uri  : MongoDB connection URI. Reads HARMBENCH_MONGO_URI env if None.
+                 Pass an empty string "" or set persist=False to disable DB.
+    judge      : Pre-constructed EnsembleJudge (kept resident for throughput).
     max_turns  : Hard cap on turns evaluated per session.
+    persist    : Whether to write results to MongoDB. Default True.
     """
 
     def __init__(
@@ -104,19 +144,31 @@ class MultiTurnEvaluator:
         mongo_uri:  Optional[str]           = None,
         judge:      Optional[EnsembleJudge] = None,
         max_turns:  int                     = 10,
+        persist:    bool                    = True,
     ):
-        self._store     = SessionStore(mongo_uri=mongo_uri)
-        self._judge     = judge or EnsembleJudge()
+        self._judge     = judge or EnsembleJudge(lazy_load=False)
         self._max_turns = max_turns
-        self._extractor = OpenAIContextExtractor()
+        self._persist   = persist
+        self._store: Optional[SessionStore] = None
+
+        if persist:
+            try:
+                self._store = SessionStore(mongo_uri=mongo_uri)
+            except Exception as exc:
+                logger.warning(
+                    "[DB] Could not connect to MongoDB (%s). "
+                    "Results will NOT be persisted.", exc
+                )
+                self._store = None
 
     # ------------------------------------------------------------------
-    # String-based session API
+    # Primary synchronous API
     # ------------------------------------------------------------------
 
     def run_session(
         self,
-        turns:         list[tuple[str, str]],
+        prompts:       list[str],
+        responses:     list[str],
         attack_method: str            = "",
         target_model:  str            = "",
         behavior_id:   str            = "",
@@ -124,87 +176,128 @@ class MultiTurnEvaluator:
         benign_turns:  Optional[set[int]] = None,
     ) -> SessionSummary:
         """
-        Evaluate a list of plain (prompt, response) string pairs.
+        Evaluate a session expressed as two parallel lists.
 
         Parameters
         ----------
-        turns         : Ordered list of (attacker_prompt, target_model_response).
-        benign_turns  : Set of 0-based turn indices considered benign probes.
-                        Defaults to {0} (the seed turn).  These are stored with
-                        is_benign=True so compute_refusal_robustness() works.
+        prompts       : Ordered attacker / user turns.
+        responses     : Ordered target model responses (same length as prompts).
+        benign_turns  : 0-based indices of benign probe turns (default: {0}).
+                        Stored with is_benign=True for Refusal Robustness metric.
         """
+        if len(prompts) != len(responses):
+            raise ValueError("prompts and responses must have equal length")
+
         sid        = session_id or str(uuid.uuid4())
         benign_set = benign_turns if benign_turns is not None else {0}
+        n          = min(len(prompts), self._max_turns)
 
-        self._store.upsert_session(
-            session_id=sid,
-            attack_method=attack_method,
-            target_model=target_model,
-            behavior_id=behavior_id,
-        )
-
-        results:     list[EnsembleResult] = []
-        breach_turn: Optional[int]        = None
-
-        for turn_idx, (prompt, response) in enumerate(turns[:self._max_turns]):
-            if self._store.already_evaluated(sid, turn_idx):
-                logger.info("[Session %s] Turn %d already in DB — skipping.", sid, turn_idx)
-                continue
-
-            is_benign = turn_idx in benign_set
-            logger.info(
-                "[Session %s] Evaluating turn %d/%d%s …",
-                sid, turn_idx, len(turns) - 1,
-                " (benign)" if is_benign else "",
-            )
-
-            result = self._judge.evaluate(
-                malicious_prompt=prompt,
-                model_response=response,
+        if self._store:
+            self._store.upsert_session(
                 session_id=sid,
-                turn_index=turn_idx,
+                attack_method=attack_method,
+                target_model=target_model,
+                behavior_id=behavior_id,
             )
-            results.append(result)
-            self._store.record_turn(result, prompt, response, is_benign=is_benign)
+
+        # ── Determine which turns need evaluation (resume support) ────
+        to_evaluate: list[int] = []
+        for i in range(n):
+            if self._store and self._store.already_evaluated(sid, i):
+                logger.info("[Session %s] Turn %d already in DB — skipping.", sid, i)
+            else:
+                to_evaluate.append(i)
+
+        # ── Batch-evaluate all pending turns in one GPU pass ─────────
+        batch_prompts   = [prompts[i]   for i in to_evaluate]
+        batch_responses = [responses[i] for i in to_evaluate]
+        raw_results: list[EnsembleResult] = []
+
+        if batch_prompts:
+            raw_results = self._judge.evaluate_batch(
+                prompts=batch_prompts,
+                responses=batch_responses,
+                session_id=sid,
+                start_turn_index=to_evaluate[0] if to_evaluate else 0,
+            )
+            # Fix turn indices (start_turn_index only works for contiguous ranges)
+            for j, res in enumerate(raw_results):
+                res.turn_index = to_evaluate[j]
+
+        # ── Assemble ordered TurnResult list ──────────────────────────
+        result_map: dict[int, EnsembleResult] = {
+            to_evaluate[j]: raw_results[j] for j in range(len(raw_results))
+        }
+
+        turn_results: list[TurnResult] = []
+        breach_turn:  Optional[int]    = None
+
+        for i in range(n):
+            is_benign = i in benign_set
+            res = result_map.get(i)
+            if res is None:
+                continue   # Already evaluated in a prior run; skip for this summary
+
+            tr = TurnResult(
+                turn_index=i,
+                prompt=prompts[i],
+                response=responses[i],
+                verdict=res.verdict.value,
+                is_breach=(res.verdict == JudgeVerdict.SUCCESS),
+                is_benign=is_benign,
+                latency_ms=res.latency_ms,
+                stage_reached=res.stage_reached,
+                refusal_detected=res.refusal_detected,
+                intent_harm=res.labels.intent_harm    if res.labels else None,
+                response_harm=res.labels.response_harm  if res.labels else None,
+                refusal_signal=res.labels.refusal_signal if res.labels else None,
+                raw_judge_output=res.raw_judge_output,
+            )
+            turn_results.append(tr)
+
+            if self._store:
+                self._store.record_turn(res, prompts[i], responses[i], is_benign=is_benign)
 
             logger.info(
                 "[Session %s] Turn %d → %-14s (%.0f ms)  I=%s H=%s R=%s",
-                sid, turn_idx, result.verdict.value, result.latency_ms,
-                result.labels.intent_harm    if result.labels else "?",
-                result.labels.response_harm  if result.labels else "?",
-                result.labels.refusal_signal if result.labels else "?",
+                sid, i, res.verdict.value, res.latency_ms,
+                res.labels.intent_harm    if res.labels else "?",
+                res.labels.response_harm  if res.labels else "?",
+                res.labels.refusal_signal if res.labels else "?",
             )
 
-            if result.verdict == JudgeVerdict.SUCCESS:
-                breach_turn = turn_idx
-                self._store.mark_breached(sid, breach_turn)
-                logger.info(
-                    "[Session %s] *** BREACH at turn %d (TTB=%d) ***",
-                    sid, turn_idx, turn_idx,
-                )
-                break
-        else:
-            self._store.mark_exhausted(sid, total_turns=len(results))
+            if res.verdict == JudgeVerdict.SUCCESS and breach_turn is None:
+                breach_turn = i
+                logger.info("[Session %s] *** BREACH at turn %d ***", sid, i)
 
-        session_doc = self._store.get_session(sid) or {}
+        # ── Mark session terminal state ───────────────────────────────
+        if self._store:
+            if breach_turn is not None:
+                self._store.mark_breached(sid, breach_turn)
+            else:
+                self._store.mark_exhausted(sid, total_turns=len(turn_results))
+
+        status = "BREACHED" if breach_turn is not None else "EXHAUSTED"
         return SessionSummary(
             session_id=sid,
             attack_method=attack_method,
             target_model=target_model,
             behavior_id=behavior_id,
-            status=session_doc.get("status", "UNKNOWN"),
-            total_turns=len(results),
+            status=status,
+            total_turns=len(turn_results),
             breach_turn=breach_turn,
-            turn_results=results,
+            turn_results=turn_results,
         )
 
     # ------------------------------------------------------------------
-    # OpenAI-native session API
+    # Async streaming API  (used by the FastAPI WebSocket endpoint)
     # ------------------------------------------------------------------
 
-    def run_session_openai(
+    async def run_session_streaming(
         self,
-        payloads:      list[dict[str, Any]],
+        prompts:       list[str],
+        responses:     list[str],
+        on_turn:       Callable[[TurnResult], Any],
         attack_method: str            = "",
         target_model:  str            = "",
         behavior_id:   str            = "",
@@ -212,91 +305,116 @@ class MultiTurnEvaluator:
         benign_turns:  Optional[set[int]] = None,
     ) -> SessionSummary:
         """
-        Evaluate a list of raw OpenAI ChatCompletion / ChatCompletionChunk dicts.
-        Step 0 (log normalisation) runs automatically inside the judge.
+        Async variant that calls ``on_turn(TurnResult)`` after each turn
+        is evaluated, enabling real-time WebSocket streaming.
 
-        Each dict in payloads represents one conversation turn.  The extractor
-        flattens its messages array into (user_intent, target_output) before
-        passing to WildGuard, so multi-turn context is preserved.
+        The GPU work runs in a thread-pool executor so the event loop
+        remains free to serve other connections during inference.
 
         Parameters
         ----------
-        payloads      : One ChatCompletion dict per turn (e.g. from production logs).
-        benign_turns  : Turn indices to mark as benign probes (default: {0}).
+        on_turn : Awaitable or plain callback invoked per turn result.
         """
+        if len(prompts) != len(responses):
+            raise ValueError("prompts and responses must have equal length")
+
         sid        = session_id or str(uuid.uuid4())
         benign_set = benign_turns if benign_turns is not None else {0}
+        n          = min(len(prompts), self._max_turns)
+        loop       = asyncio.get_event_loop()
 
-        self._store.upsert_session(
-            session_id=sid,
-            attack_method=attack_method,
-            target_model=target_model,
-            behavior_id=behavior_id,
-        )
+        if self._store:
+            self._store.upsert_session(
+                session_id=sid,
+                attack_method=attack_method,
+                target_model=target_model,
+                behavior_id=behavior_id,
+            )
 
-        results:     list[EnsembleResult] = []
-        breach_turn: Optional[int]        = None
+        turn_results: list[TurnResult] = []
+        breach_turn:  Optional[int]    = None
 
-        for turn_idx, payload in enumerate(payloads[:self._max_turns]):
-            if self._store.already_evaluated(sid, turn_idx):
-                logger.info("[Session %s] Turn %d already in DB — skipping.", sid, turn_idx)
+        for i in range(n):
+            is_benign = i in benign_set
+
+            if self._store and self._store.already_evaluated(sid, i):
+                logger.info("[Session %s] Turn %d already in DB — skipping.", sid, i)
                 continue
 
-            is_benign = turn_idx in benign_set
-            logger.info(
-                "[Session %s] (OpenAI) Evaluating turn %d/%d%s …",
-                sid, turn_idx, len(payloads) - 1,
-                " (benign)" if is_benign else "",
+            # Run GPU inference in executor (non-blocking)
+            res: EnsembleResult = await loop.run_in_executor(
+                None,
+                self._judge.evaluate,
+                prompts[i],
+                responses[i],
+                sid,
+                i,
             )
 
-            result = self._judge.evaluate_openai(
-                payload=payload,
-                session_id=sid,
-                turn_index=turn_idx,
-            )
-            results.append(result)
-
-            # Extract (prompt, response) strings for DB storage.
-            # We run extraction a second time here rather than inside the judge
-            # so the stored strings always mirror what the judge actually received.
-            exchange = self._extractor.extract(payload)
-            self._store.record_turn(
-                result,
-                exchange.user_intent,
-                exchange.target_output,
+            tr = TurnResult(
+                turn_index=i,
+                prompt=prompts[i],
+                response=responses[i],
+                verdict=res.verdict.value,
+                is_breach=(res.verdict == JudgeVerdict.SUCCESS),
                 is_benign=is_benign,
+                latency_ms=res.latency_ms,
+                stage_reached=res.stage_reached,
+                refusal_detected=res.refusal_detected,
+                intent_harm=res.labels.intent_harm    if res.labels else None,
+                response_harm=res.labels.response_harm  if res.labels else None,
+                refusal_signal=res.labels.refusal_signal if res.labels else None,
+                raw_judge_output=res.raw_judge_output,
             )
+            turn_results.append(tr)
+
+            # Stream turn to client
+            if asyncio.iscoroutinefunction(on_turn):
+                await on_turn(tr)
+            else:
+                on_turn(tr)
+
+            # Persist in background (fire-and-forget)
+            if self._store:
+                asyncio.ensure_future(
+                    loop.run_in_executor(
+                        None, self._store.record_turn,
+                        res, prompts[i], responses[i], is_benign,
+                    )
+                )
 
             logger.info(
-                "[Session %s] Turn %d → %-14s (%.0f ms)  tool_calls=%s  I=%s H=%s R=%s",
-                sid, turn_idx, result.verdict.value, result.latency_ms,
-                result.tool_calls_found,
-                result.labels.intent_harm    if result.labels else "?",
-                result.labels.response_harm  if result.labels else "?",
-                result.labels.refusal_signal if result.labels else "?",
+                "[Session %s] Turn %d → %-14s (%.0f ms)",
+                sid, i, res.verdict.value, res.latency_ms,
             )
 
-            if result.verdict == JudgeVerdict.SUCCESS:
-                breach_turn = turn_idx
-                self._store.mark_breached(sid, breach_turn)
-                logger.info(
-                    "[Session %s] *** BREACH at turn %d (TTB=%d) ***",
-                    sid, turn_idx, turn_idx,
-                )
-                break
-        else:
-            self._store.mark_exhausted(sid, total_turns=len(results))
+            if res.verdict == JudgeVerdict.SUCCESS and breach_turn is None:
+                breach_turn = i
+                logger.info("[Session %s] *** BREACH at turn %d ***", sid, i)
 
-        session_doc = self._store.get_session(sid) or {}
+        # Mark session terminal state in background
+        if self._store:
+            if breach_turn is not None:
+                asyncio.ensure_future(
+                    loop.run_in_executor(None, self._store.mark_breached, sid, breach_turn)
+                )
+            else:
+                asyncio.ensure_future(
+                    loop.run_in_executor(
+                        None, self._store.mark_exhausted, sid, len(turn_results)
+                    )
+                )
+
+        status = "BREACHED" if breach_turn is not None else "EXHAUSTED"
         return SessionSummary(
             session_id=sid,
             attack_method=attack_method,
             target_model=target_model,
             behavior_id=behavior_id,
-            status=session_doc.get("status", "UNKNOWN"),
-            total_turns=len(results),
+            status=status,
+            total_turns=len(turn_results),
             breach_turn=breach_turn,
-            turn_results=results,
+            turn_results=turn_results,
         )
 
     # ------------------------------------------------------------------
@@ -314,16 +432,24 @@ class MultiTurnEvaluator:
             summaries.append(self.run_session(**sess))
         return summaries
 
-    def run_batch_openai(self, sessions: list[dict[str, Any]]) -> list[SessionSummary]:
+    async def run_batch_async(
+        self,
+        sessions:     list[dict[str, Any]],
+        concurrency:  int = 4,
+    ) -> list[SessionSummary]:
         """
-        Evaluate multiple OpenAI-format sessions sequentially.
-        Each dict maps to the kwargs of run_session_openai().
+        Evaluate multiple sessions with bounded concurrency.
+        Useful when sessions are CPU/IO bound; GPU inference is serialised
+        internally by the shared EnsembleJudge.
         """
-        summaries: list[SessionSummary] = []
-        for i, sess in enumerate(sessions):
-            logger.info("Batch (OpenAI): session %d/%d …", i + 1, len(sessions))
-            summaries.append(self.run_session_openai(**sess))
-        return summaries
+        sem = asyncio.Semaphore(concurrency)
+
+        async def _run_one(sess: dict) -> SessionSummary:
+            async with sem:
+                loop = asyncio.get_event_loop()
+                return await loop.run_in_executor(None, self.run_session, **sess)
+
+        return list(await asyncio.gather(*[_run_one(s) for s in sessions]))
 
     # ------------------------------------------------------------------
     # Analytics
@@ -335,8 +461,16 @@ class MultiTurnEvaluator:
         target_model:  Optional[str]        = None,
         save_dir:      Optional[str | Path] = None,
         show_plots:    bool                 = True,
-    ) -> None:
-        """Compute all four metrics and print/plot them."""
+    ) -> Optional[dict[str, Any]]:
+        """Compute all four metrics and optionally print/plot them.
+
+        Returns a dict with ASR, TTB, RR, and heatmap data suitable for
+        serialisation to JSON (used by the /report REST endpoint).
+        """
+        if not self._store:
+            logger.warning("No store connected; skipping report.")
+            return None
+
         filters: dict[str, Any] = {}
         if attack_method:
             filters["attack_method"] = attack_method
@@ -366,30 +500,52 @@ class MultiTurnEvaluator:
             )
             save_dir = Path(save_dir)
             save_dir.mkdir(parents=True, exist_ok=True)
-            plot_vulnerability_heatmap(
-                heatmap,
-                save_path=save_dir / "vulnerability_heatmap.png",
-                show=show_plots,
-            )
-            plot_ttb_distribution(
-                ttb,
-                save_path=save_dir / "ttb_distribution.png",
-                show=show_plots,
-            )
-            plot_label_breakdown(
-                asr,
-                save_path=save_dir / "label_breakdown.png",
-                show=show_plots,
-            )
+            plot_vulnerability_heatmap(heatmap, save_path=save_dir / "vulnerability_heatmap.png", show=show_plots)
+            plot_ttb_distribution(ttb,          save_path=save_dir / "ttb_distribution.png",       show=show_plots)
+            plot_label_breakdown(asr,            save_path=save_dir / "label_breakdown.png",        show=show_plots)
+
+        return {
+            "asr": {
+                "total_samples":          asr.total_samples,
+                "successes":              asr.successes,
+                "failures":               asr.failures,
+                "hard_refusals":          asr.hard_refusals,
+                "errors":                 asr.errors,
+                "asr":                    asr.asr,
+                "asr_pct":                asr.asr_pct,
+                "intent_harmful_count":   asr.intent_harmful_count,
+                "response_harmful_count": asr.response_harmful_count,
+                "refusal_count":          asr.refusal_count,
+            },
+            "ttb": {
+                "sessions_evaluated": ttb.sessions_evaluated,
+                "sessions_breached":  ttb.sessions_breached,
+                "mean_ttb":           ttb.mean_ttb,
+                "median_ttb":         ttb.median_ttb,
+                "min_ttb":            ttb.min_ttb,
+                "max_ttb":            ttb.max_ttb,
+                "ttb_distribution":   ttb.ttb_distribution,
+            },
+            "refusal_robustness": {
+                "benign_total":       rr.benign_total,
+                "false_refusals":     rr.false_refusals,
+                "refusal_robustness": rr.refusal_robustness,
+            },
+            "heatmap": {
+                "categories":     heatmap.categories,
+                "attack_methods": heatmap.attack_methods,
+                "matrix":         heatmap.matrix,
+            },
+        }
 
     # ------------------------------------------------------------------
     # Context manager
     # ------------------------------------------------------------------
 
     def close(self) -> None:
-        """Release VRAM and close the MongoDB connection."""
         self._judge.teardown()
-        self._store.close()
+        if self._store:
+            self._store.close()
 
     def __enter__(self) -> "MultiTurnEvaluator":
         return self
